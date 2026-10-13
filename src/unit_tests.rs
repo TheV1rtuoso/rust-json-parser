@@ -316,7 +316,6 @@ fn test_json_string_error_invalid_unicode_escape() {
 }
 
 #[test]
-#[ignore = "seems wrong"]
 fn test_json_string_error_unescaped_control_character() {
     for input in ["\"a\nb\"", "\"a\tb\"", "\"a\rb\"", "\"a\0b\""] {
         let actual = parse_json(input);

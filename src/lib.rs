@@ -1,6 +1,7 @@
 use std::{cmp::max, collections::HashMap, eprintln};
 #[cfg(test)]
 mod unit_tests;
+#[cfg(test)]
 mod system_tests;
 
 pub struct Parser<'a> {
@@ -37,7 +38,7 @@ impl<'a> Parser<'a> {
         } else {
             FALSE_LITERAL
         };
-        if self.input.len() < self.position + 4 {
+        if self.input.len() < self.position + literal.len() {
             return Err(ParseError::UnexpectedToken(self.input.len()));
         }
         for (i, c) in literal.bytes().enumerate() {
@@ -65,6 +66,15 @@ impl<'a> Parser<'a> {
                     b'n' => { 
                         output.push('\n');
                     }
+                    b'r' => { 
+                        output.push('\r');
+                    }
+                    b'/' => { 
+                        output.push('/');
+                    }
+                    b't' => { 
+                        output.push('\t');
+                    }
                     b'"' => { 
                         output.push('"');
                     }
@@ -79,10 +89,10 @@ impl<'a> Parser<'a> {
             } else {
                 match self.input[self.position] {
                     b'\\' => is_escaped = true,
-                    b'\0' => {
-                        return Err(ParseError::UnexpectedToken(self.position));
-                    }
                     x => {
+                        if x < 0x20 {
+                            return Err(ParseError::UnexpectedToken(self.position));
+                        }
                         output.push(char::from(x));
                     }
                 }
@@ -105,7 +115,7 @@ impl<'a> Parser<'a> {
             }
     }
     fn ignore_whitespace(&mut self) -> () {
-            while self.input.len() > self.position && self.input[self.position].is_ascii_whitespace() {
+            while self.input.len() > self.position && [b'\t',b' ', b'\r', b'\n'].contains(&self.input[self.position]) {
                 self.position += 1;
             }
     }
