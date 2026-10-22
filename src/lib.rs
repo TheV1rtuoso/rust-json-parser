@@ -1,8 +1,17 @@
-use std::{cmp::max, collections::HashMap, eprintln};
-#[cfg(test)]
-mod unit_tests;
+use std::{
+    collections::HashMap,
+    eprintln,
+    num::{ParseFloatError, ParseIntError},
+};
+
+use crate::{
+    JsonElement::IntegerNumber,
+    ParseError::{LeadingZero, UnexpectedToken},
+};
 #[cfg(test)]
 mod system_tests;
+#[cfg(test)]
+mod unit_tests;
 
 pub struct Parser<'a> {
     input: &'a [u8],
@@ -12,8 +21,13 @@ pub struct Parser<'a> {
 #[derive(Debug, PartialEq)]
 pub enum ParseError {
     UnexpectedError,
+    FloatParsingError(ParseFloatError),
+    IntParsingError(ParseIntError),
     NotSupported(String),
     UnexpectedToken(usize),
+    UnexpectedEOF(usize),
+    LeadingZero(usize),
+    LeadingPlus(usize),
 }
 
 #[derive(Debug, PartialEq)]
@@ -27,8 +41,73 @@ pub enum JsonElement {
     Object(HashMap<String, JsonElement>),
 }
 
-
 impl<'a> Parser<'a> {
+    fn curr(&mut self) -> Result<u8, ParseError> {
+        if self.position < self.input.len() {
+            Ok(self.input[self.position])
+        } else {
+            Err(ParseError::UnexpectedEOF(self.position))
+        }
+    }
+    fn next(&mut self) -> Result<u8, ParseError> {
+        self.position += 1;
+        self.curr()
+    }
+    #[allow(unused)]
+    fn peek(&mut self) -> Result<u8, ParseError> {
+        if self.position + 1 < self.input.len() {
+            Ok(self.input[self.position + 1])
+        } else {
+            Err(ParseError::UnexpectedToken(self.position))
+        }
+    }
+    fn parse_json_number(&mut self) -> Result<JsonElement, ParseError> {
+        assert!(self.check_eof().is_ok());
+        let start_idx = self.position;
+        let _is_negative = self.accept(b'-').is_ok();
+        if self.curr() == Ok(b'0') {
+            self.position += 1;
+            if self.curr().is_err() {
+                return Ok(IntegerNumber(0));
+            }
+            if self.curr()?.is_ascii_digit() {
+                return Err(LeadingZero(self.position));
+            }
+        } else if self.curr()?.is_ascii_digit() {
+            while self.next().is_ok_and(|b| b.is_ascii_digit()) {}
+        } else {
+            return Err(UnexpectedToken(self.position));
+        }
+        let is_float = self.accept(b'.').is_ok();
+        if is_float {
+            if self.curr()?.is_ascii_digit() {
+                while self.next().is_ok_and(|b| b.is_ascii_digit()) {}
+            } else {
+                return Err(UnexpectedToken(self.position));
+            }
+        }
+        let is_exponential = self.accept(b'E').is_ok() || self.accept(b'e').is_ok();
+        if is_exponential {
+            let _exponential_sign = self.accept(b'-').is_ok() || self.accept(b'+').is_ok();
+            if self.curr()?.is_ascii_digit() {
+                while self.next().is_ok_and(|b| b.is_ascii_digit()) {}
+            } else {
+                return Err(UnexpectedToken(self.position));
+            }
+        }
+        if is_float || is_exponential {
+            let text = std::str::from_utf8(&self.input[start_idx..self.position])
+                .expect("Failed to transform to string");
+            let number = text.parse::<f64>().map_err(ParseError::FloatParsingError)?;
+            Ok(JsonElement::FloatNumber(number))
+        } else {
+            let text = std::str::from_utf8(&self.input[start_idx..self.position])
+                .expect("Failed to transform to string");
+            let number = text.parse::<i64>().map_err(ParseError::IntParsingError)?;
+            Ok(JsonElement::IntegerNumber(number))
+        }
+    }
+
     fn parse_json_bool(&mut self) -> Result<JsonElement, ParseError> {
         const TRUE_LITERAL: &str = "true";
         const FALSE_LITERAL: &str = "false";
@@ -39,7 +118,7 @@ impl<'a> Parser<'a> {
             FALSE_LITERAL
         };
         if self.input.len() < self.position + literal.len() {
-            return Err(ParseError::UnexpectedToken(self.input.len()));
+            return Err(ParseError::UnexpectedEOF(self.input.len()));
         }
         for (i, c) in literal.bytes().enumerate() {
             if self.input[self.position + i] != c {
@@ -47,39 +126,38 @@ impl<'a> Parser<'a> {
             }
         }
         self.position += literal.len();
-        return Ok(JsonElement::Boolean(try_true));
+        Ok(JsonElement::Boolean(try_true))
     }
 
     fn parse_json_string(&mut self) -> Result<JsonElement, ParseError> {
-        if self.check_eof()? && self.input[self.position] != b'"' {
-            return Err(ParseError::UnexpectedToken(self.position));
-        }
-        self.position += 1;
-        let mut output = String::with_capacity(32);
+        self.accept(b'"')?;
+        let mut output = String::with_capacity(16);
         let mut is_escaped = false;
-        while self.position < self.input.len() && !(!is_escaped && self.input[self.position] == b'"') {
+        while self.curr()? != b'"' || is_escaped {
             if is_escaped {
                 match self.input[self.position] {
                     b'\\' => {
                         output.push('\\');
                     }
-                    b'n' => { 
+                    b'n' => {
                         output.push('\n');
                     }
-                    b'r' => { 
+                    b'r' => {
                         output.push('\r');
                     }
-                    b'/' => { 
+                    b'/' => {
                         output.push('/');
                     }
-                    b't' => { 
+                    b't' => {
                         output.push('\t');
                     }
-                    b'"' => { 
+                    b'"' => {
                         output.push('"');
                     }
-                    b'u' => { 
-                        return Err(ParseError::NotSupported("Unicode not supported yet".to_string()));
+                    b'u' => {
+                        return Err(ParseError::NotSupported(
+                            "Unicode not supported yet".to_string(),
+                        ));
                     }
                     _ => {
                         return Err(ParseError::UnexpectedToken(self.position));
@@ -103,31 +181,30 @@ impl<'a> Parser<'a> {
         Ok(JsonElement::String(output))
     }
     fn accept(&mut self, expected: u8) -> Result<(), ParseError> {
-            if self.input.len() <= self.position {
-                Err(ParseError::UnexpectedToken(self.position))
-            } else {
-                if self.input[self.position] == expected {
-                    self.position += 1;
-                    Ok(())
-                } else {
-                Err(ParseError::UnexpectedToken(self.position))
-                }
-            }
+        if self.curr()? == expected {
+            self.position += 1;
+            Ok(())
+        } else {
+            Err(ParseError::UnexpectedToken(self.position))
+        }
     }
-    fn ignore_whitespace(&mut self) -> () {
-            while self.input.len() > self.position && [b'\t',b' ', b'\r', b'\n'].contains(&self.input[self.position]) {
-                self.position += 1;
-            }
+    
+    #[allow(clippy::byte_char_slices)]
+    fn ignore_whitespace(&mut self) {
+        while self.input.len() > self.position
+            && [b'\t', b' ', b'\r', b'\n'].contains(&self.input[self.position])
+        {
+            self.position += 1;
+        }
     }
-
 
     fn parse_json_array(&mut self) -> Result<JsonElement, ParseError> {
         self.accept(b'[')?;
         let mut output = Vec::<JsonElement>::with_capacity(16);
         self.ignore_whitespace();
-        while self.position < self.input.len() && !(self.input[self.position] == b']') {
-            if output.len() > 0 {
-                self.accept(b',')?;
+        while self.curr()? != b']' {
+            if !output.is_empty() && self.accept(b',').is_err() {
+                return Err(ParseError::UnexpectedToken(self.position));
             }
             self.ignore_whitespace();
             output.push(self.parse_json_element()?);
@@ -140,7 +217,7 @@ impl<'a> Parser<'a> {
     fn parse_null(&mut self) -> Result<JsonElement, ParseError> {
         const NULL_LITERAL: &str = "null";
         if self.input.len() < self.position + 4 {
-            return Err(ParseError::UnexpectedToken(max(self.input.len(), 0)));
+            return Err(ParseError::UnexpectedEOF(self.input.len()));
         }
         for (i, c) in NULL_LITERAL.bytes().enumerate() {
             if self.input[self.position + i] != c {
@@ -150,11 +227,11 @@ impl<'a> Parser<'a> {
         self.position += 4;
         Ok(JsonElement::Null)
     }
-    fn check_eof(&self) -> Result<bool, ParseError>{
+    fn check_eof(&self) -> Result<bool, ParseError> {
         if self.position < self.input.len() {
             Ok(true)
         } else {
-            Err(ParseError::UnexpectedToken(self.position))
+            Err(ParseError::UnexpectedEOF(self.position))
         }
     }
 
@@ -162,8 +239,8 @@ impl<'a> Parser<'a> {
         self.accept(b'{')?;
         let mut output = HashMap::<String, JsonElement>::new();
         self.ignore_whitespace();
-        while self.check_eof()? && !(self.input[self.position] == b'}') {
-            if output.len() > 0 {
+        while self.curr()? != b'}' {
+            if !output.is_empty() {
                 self.accept(b',')?;
                 self.ignore_whitespace();
             }
@@ -184,24 +261,30 @@ impl<'a> Parser<'a> {
     fn parse_json_element(&mut self) -> Result<JsonElement, ParseError> {
         self.check_eof()?;
         match self.input[self.position] {
-                b'n' => self.parse_null(),
-                b't' => self.parse_json_bool(),
-                b'f' => self.parse_json_bool(),
-                b'"' => self.parse_json_string(),
-                b'[' => self.parse_json_array(),
-                b'{' => self.parse_json_object(),
-                _ => Err(ParseError::UnexpectedToken(self.position)),
+            b'n' => self.parse_null(),
+            b't' => self.parse_json_bool(),
+            b'f' => self.parse_json_bool(),
+            b'"' => self.parse_json_string(),
+            b'[' => self.parse_json_array(),
+            b'{' => self.parse_json_object(),
+            b'-' => self.parse_json_number(),
+            b'+' => Err(ParseError::LeadingPlus(self.position)),
+            _x @ b'0'..=b'9' => self.parse_json_number(),
+            _ => Err(ParseError::UnexpectedToken(self.position)),
         }
     }
 }
 
-pub fn print_json_error(parser: &Parser, err:  &ParseError) {
+pub fn print_json_error(parser: &Parser, err: &ParseError) {
     if let ParseError::UnexpectedToken(idx) = err {
-        if idx.to_owned() >= parser.input.len() {
+        if *idx >= parser.input.len() {
             eprintln!("Json Parsing Error: Unexpected End of File");
         } else {
-            let error_char =  parser.input[idx.to_owned()];
-            eprintln!("Json Parsing Error at idx {idx} ({}): UnexpectedToken", char::from(error_char));
+            let error_char = parser.input[idx.to_owned()];
+            eprintln!(
+                "Json Parsing Error at idx {idx} ({}): UnexpectedToken",
+                char::from(error_char)
+            );
         }
     } else {
         eprintln!("Unexpected Json Parsing Error");
@@ -215,9 +298,9 @@ pub fn parse_json(json_string: &str) -> Result<JsonElement, ParseError> {
     parser.ignore_whitespace();
     let res = parser.parse_json_element()?;
     parser.ignore_whitespace();
-   if parser.position == parser.input.len() {
+    if parser.position == parser.input.len() {
         Ok(res)
-   } else {
+    } else {
         Err(ParseError::UnexpectedToken(parser.position))
     }
 }
