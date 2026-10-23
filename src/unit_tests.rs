@@ -641,13 +641,70 @@ fn test_json_string() {
         (r#""hello""#, "hello"),
         (r#""""#, ""),
         (r#""hello world""#, "hello world"),
-        //(r#""café 🦀""#, "café 🦀"), TODO implement
+        (r#""café 🦀""#, "café 🦀"),
     ] {
         let actual = parse_json(input, None);
         let expected = Ok(JsonElement::String(text.to_owned()));
         assert!(
             actual == expected,
             "input {input:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn test_json_string_literal_unicode_widths_and_boundaries() {
+    for value in [
+        "\u{7f}",
+        "\u{80}",
+        "é",
+        "\u{7ff}",
+        "\u{800}",
+        "中",
+        "\u{d7ff}",
+        "\u{e000}",
+        "\u{ffff}",
+        "\u{10000}",
+        "🦀",
+        "\u{10ffff}",
+    ] {
+        let input = format!("\"{value}\"");
+        assert_eq!(
+            parse_json(&input, None),
+            Ok(JsonElement::String(value.to_owned())),
+            "input {input:?}"
+        );
+    }
+}
+
+#[test]
+fn test_json_string_literal_unicode_consumes_full_utf8_sequences() {
+    let input = "xx\"é中🦀\",tail";
+    let mut parser = Parser {
+        input: input.as_bytes(),
+        position: 2,
+        max_nesting: None,
+        recursion_depth: 0,
+    };
+
+    assert_eq!(
+        parser.parse_json_string(),
+        Ok(JsonElement::String("é中🦀".to_owned()))
+    );
+    assert_eq!(parser.position, "xx\"é中🦀\"".len());
+    assert_eq!(parser.curr(), Ok(b','));
+}
+
+#[test]
+fn test_json_string_unicode_escapes_decode_to_same_text_as_literals() {
+    for (input, expected) in [
+        (r#""\u0041\u00e9\u4E2D""#, "Aé中"),
+        (r#""\uD83E\uDD80""#, "🦀"),
+    ] {
+        assert_eq!(
+            parse_json(input, None),
+            Ok(JsonElement::String(expected.to_owned())),
+            "input {input:?}"
         );
     }
 }
@@ -699,17 +756,17 @@ fn test_json_string_error_invalid_escape() {
 }
 
 #[test]
-#[ignore = "Unicode escapes not implemented yet"]
-fn test_json_string_error_invalid_unicode_escape() {
-    for (input, position) in [(r#""\u12G4""#, 5), (r#""\u12""#, 5)] {
-        let actual = parse_json(input, None);
-        // A Unicode escape requires four hexadecimal digits.
-        let expected = Err(ParseError::UnexpectedToken(position));
-        assert!(
-            actual == expected,
-            "input {input:?}: expected {expected:?}, got {actual:?}"
-        );
-    }
+fn test_json_string_error_invalid_unicode_hex_digit() {
+    let input = r#""\u12G4""#;
+    let expected = Err(ParseError::UnicodeError(2));
+    assert_eq!(parse_json(input, None), expected);
+}
+
+#[test]
+fn test_json_string_error_unicode_escape_truncated_at_eof() {
+    let input = r#""x\u12"#;
+    let expected = Err(ParseError::UnexpectedEOF(input.len()));
+    assert_eq!(parse_json(input, None), expected);
 }
 
 #[test]

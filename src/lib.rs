@@ -1,12 +1,15 @@
 use std::{
+    char,
     collections::HashMap,
-    eprintln,
+    dbg, eprintln,
     num::{ParseFloatError, ParseIntError},
+    ops::RangeInclusive,
+    str,
 };
 
 use crate::{
     JsonElement::IntegerNumber,
-    ParseError::{LeadingZero, UnexpectedToken},
+    ParseError::{LeadingZero, UTF8Error, UnexpectedEOF, UnexpectedToken},
 };
 #[cfg(test)]
 mod system_tests;
@@ -23,6 +26,8 @@ pub struct Parser<'a> {
 #[derive(Debug, PartialEq)]
 pub enum ParseError {
     UnexpectedError,
+    UTF8Error(usize),
+    UnicodeError(usize),
     MaxRecursionDepthReached(usize),
     FloatParsingError(ParseFloatError),
     IntParsingError(ParseIntError),
@@ -158,27 +163,95 @@ impl<'a> Parser<'a> {
                         output.push('"');
                     }
                     b'u' => {
-                        return Err(ParseError::NotSupported(
-                            "Unicode not supported yet".to_string(),
-                        ));
+                        const HIGH_SURROGATE_RANGE: RangeInclusive<u32> = 0xD800..=0xDBFF;
+                        if self.position + 5 > self.input.len() {
+                            return Err(UnexpectedEOF(self.input.len()));
+                        }
+                        let text =
+                            str::from_utf8(&self.input[self.position + 1..self.position + 5])
+                                .map_err(|_| ParseError::UnicodeError(self.position))?;
+                        let first_escape: u32 = u32::from_str_radix(text, 16)
+                            .map_err(|_| ParseError::UnicodeError(self.position))?;
+                        dbg!(first_escape);
+                        let c: char = if HIGH_SURROGATE_RANGE.contains(&first_escape) {
+                            self.position += 5;
+                            self.accept(b'\\')
+                                .map_err(|_| ParseError::UnicodeError(self.position))?;
+                            self.accept(b'u')
+                                .map_err(|_| ParseError::UnicodeError(self.position))?;
+                            if self.position + 4 > self.input.len() {
+                                return Err(UnexpectedEOF(self.input.len()));
+                            }
+                            let text =
+                                str::from_utf8(&self.input[self.position..self.position + 4])
+                                    .map_err(|_| ParseError::UnicodeError(self.position))?;
+                            let second_escape: u32 = u32::from_str_radix(text, 16)
+                                .map_err(|_| ParseError::UnicodeError(self.position))?;
+                            self.position += 3;
+                            let full_escape = 0x10000
+                                + ((first_escape - 0xD800) << 10)
+                                + (second_escape - 0xDC00);
+                            char::from_u32(full_escape)
+                                .ok_or(ParseError::UnicodeError(self.position))?
+                        } else {
+                            self.position += 4;
+                            char::from_u32(first_escape)
+                                .ok_or(ParseError::UnicodeError(self.position))?
+                        };
+                        output.push(c);
                     }
                     _ => {
                         return Err(ParseError::UnexpectedToken(self.position));
                     }
                 }
                 is_escaped = false;
+                self.position += 1
             } else {
                 match self.input[self.position] {
-                    b'\\' => is_escaped = true,
-                    x => {
+                    b'\\' => {
+                        is_escaped = true;
+                        self.position += 1;
+                    }
+                    x @ 0x0..=0x7F => {
+                        // Ascii
                         if x < 0x20 {
                             return Err(ParseError::UnexpectedToken(self.position));
                         }
                         output.push(char::from(x));
+                        self.position += 1;
+                    }
+                    _x @ 0x80..=0x8F => {
+                        //continuation
+                        return Err(UTF8Error(self.position));
+                    }
+                    _x @ 0xC2..=0xDF => {
+                        //2 Byte Sequence
+                        let bytes = &self.input[self.position..self.position + 2];
+                        let text = std::str::from_utf8(bytes)
+                            .map_err(|_| ParseError::UTF8Error(self.position))?;
+                        output.push_str(text);
+                        self.position += 2;
+                    }
+                    _x @ 0xE0..=0xEF => {
+                        //3 Byte Sequence
+                        let bytes = &self.input[self.position..self.position + 3];
+                        let text = std::str::from_utf8(bytes)
+                            .map_err(|_| ParseError::UTF8Error(self.position))?;
+                        output.push_str(text);
+                        self.position += 3;
+                    }
+                    _x @ 0xF0..=0xF4 => {
+                        let bytes = &self.input[self.position..self.position + 4];
+                        let text = std::str::from_utf8(bytes)
+                            .map_err(|_| ParseError::UTF8Error(self.position))?;
+                        output.push_str(text);
+                        self.position += 4;
+                    }
+                    _ => {
+                        return Err(ParseError::UnexpectedToken(self.position));
                     }
                 }
             }
-            self.position += 1;
         }
         self.accept(b'"')?;
         Ok(JsonElement::String(output))
@@ -260,7 +333,7 @@ impl<'a> Parser<'a> {
         self.accept(b'}')?;
         Ok(JsonElement::Object(output))
     }
-
+    #[inline]
     fn recursion_guard<F>(&mut self, f: F) -> Result<JsonElement, ParseError>
     where
         F: FnOnce(&mut Self) -> Result<JsonElement, ParseError>,
