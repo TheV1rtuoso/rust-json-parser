@@ -16,11 +16,14 @@ mod unit_tests;
 pub struct Parser<'a> {
     input: &'a [u8],
     position: usize,
+    max_nesting: Option<usize>,
+    recursion_depth: usize,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum ParseError {
     UnexpectedError,
+    MaxRecursionDepthReached(usize),
     FloatParsingError(ParseFloatError),
     IntParsingError(ParseIntError),
     NotSupported(String),
@@ -188,7 +191,7 @@ impl<'a> Parser<'a> {
             Err(ParseError::UnexpectedToken(self.position))
         }
     }
-    
+
     #[allow(clippy::byte_char_slices)]
     fn ignore_whitespace(&mut self) {
         while self.input.len() > self.position
@@ -258,6 +261,23 @@ impl<'a> Parser<'a> {
         Ok(JsonElement::Object(output))
     }
 
+    fn recursion_guard<F>(&mut self, f: F) -> Result<JsonElement, ParseError>
+    where
+        F: FnOnce(&mut Self) -> Result<JsonElement, ParseError>,
+    {
+        if let Some(max_depth) = self.max_nesting {
+            if self.recursion_depth + 1 > max_depth {
+                return Err(ParseError::MaxRecursionDepthReached(self.position));
+            }
+            self.recursion_depth += 1;
+        }
+        let res = f(self);
+        if self.max_nesting.is_some() {
+            self.recursion_depth -= 1;
+        }
+        res
+    }
+
     fn parse_json_element(&mut self) -> Result<JsonElement, ParseError> {
         self.check_eof()?;
         match self.input[self.position] {
@@ -265,8 +285,8 @@ impl<'a> Parser<'a> {
             b't' => self.parse_json_bool(),
             b'f' => self.parse_json_bool(),
             b'"' => self.parse_json_string(),
-            b'[' => self.parse_json_array(),
-            b'{' => self.parse_json_object(),
+            b'[' => self.recursion_guard(Parser::parse_json_array),
+            b'{' => self.recursion_guard(Parser::parse_json_object),
             b'-' => self.parse_json_number(),
             b'+' => Err(ParseError::LeadingPlus(self.position)),
             _x @ b'0'..=b'9' => self.parse_json_number(),
@@ -290,10 +310,15 @@ pub fn print_json_error(parser: &Parser, err: &ParseError) {
         eprintln!("Unexpected Json Parsing Error");
     }
 }
-pub fn parse_json(json_string: &str) -> Result<JsonElement, ParseError> {
+pub fn parse_json(
+    json_string: &str,
+    max_nesting: Option<usize>,
+) -> Result<JsonElement, ParseError> {
     let mut parser = Parser {
         input: json_string.as_bytes(),
         position: 0,
+        recursion_depth: 0,
+        max_nesting,
     };
     parser.ignore_whitespace();
     let res = parser.parse_json_element()?;
