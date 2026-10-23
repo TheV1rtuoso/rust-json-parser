@@ -170,6 +170,36 @@ fn trailing_value_file_reports_second_value() {
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
 }
 
+#[test]
+fn literal_unicode_in_object_keys_and_array_values() {
+    let input = r#"{"café":["é","中","🦀"]}"#;
+    let expected = object(vec![(
+        "café",
+        array(vec![text("é"), text("中"), text("🦀")]),
+    )]);
+
+    assert_eq!(parse_json(input, Some(2)), Ok(expected));
+}
+
+#[test]
+fn literal_and_escaped_unicode_have_equal_values() {
+    let input = r#"["é中🦀","\u00E9\u4e2d\uD83E\uDD80"]"#;
+    let expected = array(vec![text("é中🦀"), text("é中🦀")]);
+
+    assert_eq!(parse_json(input, Some(1)), Ok(expected));
+}
+
+#[test]
+fn trailing_input_position_after_literal_unicode_is_a_byte_offset() {
+    let input = "\"é中🦀\"true";
+    let position = input.find("true").unwrap();
+
+    assert_eq!(
+        parse_json(input, None),
+        Err(ParseError::UnexpectedToken(position))
+    );
+}
+
 mod recursion_depth_tests {
     use super::*;
     use JsonElement::{Boolean, FloatNumber, Null};
