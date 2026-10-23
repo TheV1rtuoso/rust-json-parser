@@ -1,11 +1,153 @@
 use super::*;
 
+mod recursion_depth_tests {
+    use super::*;
+
+    #[test]
+    fn guard_increments_during_callback_and_restores_depth_on_success() {
+        let mut parser = Parser {
+            input: b"xx[]",
+            position: 2,
+            max_nesting: Some(2),
+            recursion_depth: 1,
+        };
+
+        let actual = parser.recursion_guard(|parser| {
+            assert_eq!(parser.recursion_depth, 2);
+            assert_eq!(parser.position, 2);
+            Ok(JsonElement::Null)
+        });
+
+        assert_eq!(actual, Ok(JsonElement::Null));
+        assert_eq!(parser.recursion_depth, 1);
+        assert_eq!(parser.position, 2);
+    }
+
+    #[test]
+    fn guard_restores_depth_and_propagates_callback_error() {
+        let mut parser = Parser {
+            input: b"xx?",
+            position: 2,
+            max_nesting: Some(2),
+            recursion_depth: 1,
+        };
+
+        let actual = parser.recursion_guard(|parser| {
+            assert_eq!(parser.recursion_depth, 2);
+            Err(ParseError::UnexpectedToken(parser.position))
+        });
+
+        assert_eq!(actual, Err(ParseError::UnexpectedToken(2)));
+        assert_eq!(parser.recursion_depth, 1);
+        assert_eq!(parser.position, 2);
+    }
+
+    #[test]
+    fn disabled_limit_runs_nested_callbacks_without_changing_counter() {
+        let mut parser = Parser {
+            input: b"[]",
+            position: 0,
+            max_nesting: None,
+            recursion_depth: 0,
+        };
+
+        let actual = parser.recursion_guard(|parser| {
+            assert_eq!(parser.recursion_depth, 0);
+            parser.recursion_guard(|parser| {
+                assert_eq!(parser.recursion_depth, 0);
+                Ok(JsonElement::Null)
+            })
+        });
+
+        assert_eq!(actual, Ok(JsonElement::Null));
+        assert_eq!(parser.recursion_depth, 0);
+        assert_eq!(parser.position, 0);
+    }
+
+    #[test]
+    fn rejected_guard_preserves_depth_and_cursor_without_running_callback() {
+        let mut parser = Parser {
+            input: b"xx[]",
+            position: 2,
+            max_nesting: Some(1),
+            recursion_depth: 1,
+        };
+        let mut called = false;
+
+        let actual = parser.recursion_guard(|_| {
+            called = true;
+            Ok(JsonElement::Null)
+        });
+
+        assert_eq!(actual, Err(ParseError::MaxRecursionDepthReached(2)));
+        assert!(!called, "a rejected guard must not run its callback");
+        assert_eq!(parser.position, 2);
+        assert_eq!(parser.recursion_depth, 1);
+    }
+
+    #[test]
+    fn nested_depth_error_restores_all_active_guards() {
+        let mut parser = Parser {
+            input: b"[[]]",
+            position: 0,
+            max_nesting: Some(1),
+            recursion_depth: 0,
+        };
+
+        assert_eq!(
+            parser.parse_json_element(),
+            Err(ParseError::MaxRecursionDepthReached(1))
+        );
+        assert_eq!(
+            parser.position, 1,
+            "rejected opening bracket stays unconsumed"
+        );
+        assert_eq!(parser.recursion_depth, 0);
+    }
+
+    #[test]
+    fn nested_syntax_error_restores_all_active_guards() {
+        let mut parser = Parser {
+            input: b"[[?]]",
+            position: 0,
+            max_nesting: Some(2),
+            recursion_depth: 0,
+        };
+
+        assert_eq!(
+            parser.parse_json_element(),
+            Err(ParseError::UnexpectedToken(2))
+        );
+        assert_eq!(parser.position, 2);
+        assert_eq!(parser.recursion_depth, 0);
+    }
+
+    #[test]
+    fn element_dispatch_guards_both_container_types_at_current_position() {
+        for (input, expected) in [
+            ("xx[]tail", JsonElement::Array(vec![])),
+            ("xx{}tail", JsonElement::Object(HashMap::new())),
+        ] {
+            let mut parser = Parser {
+                input: input.as_bytes(),
+                position: 2,
+                max_nesting: Some(1),
+                recursion_depth: 0,
+            };
+
+            assert_eq!(parser.parse_json_element(), Ok(expected), "{input:?}");
+            assert_eq!(parser.position, 4, "{input:?}");
+            assert_eq!(parser.recursion_depth, 0, "{input:?}");
+        }
+    }
+}
+
 mod number_tests {
     use super::*;
     use JsonElement::{Array, FloatNumber};
 
     fn check(input: &str, expected: JsonElement) {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         let expected = Ok(expected);
         assert!(
             actual == expected,
@@ -14,7 +156,7 @@ mod number_tests {
     }
 
     fn check_invalid(input: &str) {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         assert!(
             actual.is_err(),
             "input {input:?}: expected a parsing error, got {actual:?}"
@@ -68,7 +210,7 @@ mod number_tests {
 
     #[test]
     fn negative_float_zero_preserves_sign() {
-        let actual = parse_json("-0.0");
+        let actual = parse_json("-0.0", None);
         match actual {
             Ok(FloatNumber(value)) => {
                 assert_eq!(value, 0.0);
@@ -116,6 +258,8 @@ mod number_tests {
         let mut parser = Parser {
             input: b"xx12.5,tail",
             position: 2,
+            max_nesting: None,
+            recursion_depth: 0,
         };
         let actual = parser.parse_json_number();
         let expected = Ok(FloatNumber(12.5));
@@ -179,7 +323,7 @@ mod object_tests {
     }
 
     fn check(input: &str, expected: Result<JsonElement, ParseError>) {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         assert!(
             actual == expected,
             "input {input:?}: expected {expected:?}, got {actual:?}"
@@ -260,6 +404,8 @@ mod object_tests {
         let mut parser = Parser {
             input: b"xx{\"a\":null}tail",
             position: 2,
+            max_nesting: None,
+            recursion_depth: 0,
         };
         let actual = parser.parse_json_object();
         let expected = Ok(object(vec![("a", Null)]));
@@ -328,7 +474,7 @@ mod array_tests {
     use JsonElement::{Array, Boolean, Null};
 
     fn check(input: &str, expected: Result<JsonElement, ParseError>) {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         assert!(
             actual == expected,
             "input {input:?}: expected {expected:?}, got {actual:?}"
@@ -418,6 +564,8 @@ mod array_tests {
             let mut parser = Parser {
                 input: input.as_bytes(),
                 position: 0,
+                max_nesting: None,
+                recursion_depth: 0,
             };
             let actual = parser.parse_json_array();
             assert!(
@@ -437,6 +585,8 @@ mod array_tests {
         let mut parser = Parser {
             input: b"xx[null]tail",
             position: 2,
+            max_nesting: None,
+            recursion_depth: 0,
         };
         let actual = parser.parse_json_array();
         let expected = Ok(Array(vec![Null]));
@@ -493,7 +643,7 @@ fn test_json_string() {
         (r#""hello world""#, "hello world"),
         //(r#""café 🦀""#, "café 🦀"), TODO implement
     ] {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         let expected = Ok(JsonElement::String(text.to_owned()));
         assert!(
             actual == expected,
@@ -505,7 +655,7 @@ fn test_json_string() {
 #[test]
 fn test_json_string_unterminated() {
     for input in ["\"", "\"hello", "\"café"] {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         let expected = Err(ParseError::UnexpectedEOF(input.len()));
         assert!(
             actual == expected,
@@ -516,21 +666,21 @@ fn test_json_string_unterminated() {
 
 #[test]
 fn test_json_string_escaped_quote() {
-    let actual = parse_json(r#""say \"hello\"""#);
+    let actual = parse_json(r#""say \"hello\"""#, None);
     let expected = Ok(JsonElement::String("say \"hello\"".to_owned()));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
 }
 
 #[test]
 fn test_json_string_escaped_newline() {
-    let actual = parse_json(r#""hello\nworld""#);
+    let actual = parse_json(r#""hello\nworld""#, None);
     let expected = Ok(JsonElement::String("hello\nworld".to_owned()));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
 }
 
 #[test]
 fn test_json_string_escaped_backslash() {
-    let actual = parse_json(r#""a\\b""#);
+    let actual = parse_json(r#""a\\b""#, None);
     let expected = Ok(JsonElement::String("a\\b".to_owned()));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
 }
@@ -538,7 +688,7 @@ fn test_json_string_escaped_backslash() {
 #[test]
 fn test_json_string_error_invalid_escape() {
     for input in [r#""\q""#, r#""\x41""#] {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         // The byte after the backslash must name a valid JSON escape.
         let expected = Err(ParseError::UnexpectedToken(2));
         assert!(
@@ -552,7 +702,7 @@ fn test_json_string_error_invalid_escape() {
 #[ignore = "Unicode escapes not implemented yet"]
 fn test_json_string_error_invalid_unicode_escape() {
     for (input, position) in [(r#""\u12G4""#, 5), (r#""\u12""#, 5)] {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         // A Unicode escape requires four hexadecimal digits.
         let expected = Err(ParseError::UnexpectedToken(position));
         assert!(
@@ -565,7 +715,7 @@ fn test_json_string_error_invalid_unicode_escape() {
 #[test]
 fn test_json_string_error_unescaped_control_character() {
     for input in ["\"a\nb\"", "\"a\tb\"", "\"a\rb\"", "\"a\0b\""] {
-        let actual = parse_json(input);
+        let actual = parse_json(input, None);
         let expected = Err(ParseError::UnexpectedToken(2));
         assert!(
             actual == expected,
@@ -577,7 +727,7 @@ fn test_json_string_error_unescaped_control_character() {
 #[test]
 fn test_json_string_error_dangling_escape() {
     let input = "\"hello\\";
-    let actual = parse_json(input);
+    let actual = parse_json(input, None);
     let expected = Err(ParseError::UnexpectedEOF(input.len()));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
 }
@@ -585,7 +735,7 @@ fn test_json_string_error_dangling_escape() {
 #[test]
 fn test_json_string_error_escaped_quote_without_closing_quote() {
     let input = r#""hello\""#;
-    let actual = parse_json(input);
+    let actual = parse_json(input, None);
     // The escaped quote is string content, so the closing quote is missing.
     let expected = Err(ParseError::UnexpectedEOF(input.len()));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
@@ -593,29 +743,29 @@ fn test_json_string_error_escaped_quote_without_closing_quote() {
 
 #[test]
 fn parse_null() {
-    let actual = parse_json("n");
+    let actual = parse_json("n", None);
     let expected: Result<JsonElement, ParseError> = Err(ParseError::UnexpectedEOF(1));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
-    let actual = parse_json("nu");
+    let actual = parse_json("nu", None);
     let expected: Result<JsonElement, ParseError> = Err(ParseError::UnexpectedEOF(2));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
-    let actual = parse_json("null");
+    let actual = parse_json("null", None);
     let expected: Result<JsonElement, ParseError> = Ok(JsonElement::Null);
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
 }
 
 #[test]
 fn parse_bool() {
-    let actual = parse_json("t");
+    let actual = parse_json("t", None);
     let expected: Result<JsonElement, ParseError> = Err(ParseError::UnexpectedEOF(1));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
-    let actual = parse_json("fa");
+    let actual = parse_json("fa", None);
     let expected: Result<JsonElement, ParseError> = Err(ParseError::UnexpectedEOF(2));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
-    let actual = parse_json("true");
+    let actual = parse_json("true", None);
     let expected: Result<JsonElement, ParseError> = Ok(JsonElement::Boolean(true));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
-    let actual = parse_json("false");
+    let actual = parse_json("false", None);
     let expected: Result<JsonElement, ParseError> = Ok(JsonElement::Boolean(false));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
 }
