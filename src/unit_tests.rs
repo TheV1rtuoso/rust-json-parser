@@ -699,7 +699,9 @@ fn test_json_string_literal_unicode_consumes_full_utf8_sequences() {
 fn test_json_string_unicode_escapes_decode_to_same_text_as_literals() {
     for (input, expected) in [
         (r#""\u0041\u00e9\u4E2D""#, "Aé中"),
+        (r#""\uD800\uDC00""#, "\u{10000}"),
         (r#""\uD83E\uDD80""#, "🦀"),
+        (r#""\uDBFF\uDFFF""#, "\u{10ffff}"),
     ] {
         assert_eq!(
             parse_json(input, None),
@@ -740,6 +742,44 @@ fn test_json_string_escaped_backslash() {
     let actual = parse_json(r#""a\\b""#, None);
     let expected = Ok(JsonElement::String("a\\b".to_owned()));
     assert!(actual == expected, "expected {expected:?}, got {actual:?}");
+}
+
+#[test]
+fn test_json_string_all_short_escapes() {
+    let input = r#""\b\f\/\"\t\r\n\\""#;
+    let expected = JsonElement::String("\u{0008}\u{000c}/\"\t\r\n\\".to_owned());
+    assert_eq!(parse_json(input, None), Ok(expected));
+}
+
+#[test]
+fn test_json_string_unicode_escapes_can_produce_syntax_characters_and_controls() {
+    let input = r#""\u005C\u0022\u0000""#;
+    let expected = JsonElement::String("\\\"\0".to_owned());
+    assert_eq!(parse_json(input, None), Ok(expected));
+}
+
+#[test]
+fn test_json_string_rejects_unpaired_surrogates_and_malformed_unicode() {
+    for (input, expected) in [
+        (r#""\uDD80""#, ParseError::UnicodeError(2)),
+        (r#""\uD83E\u0041""#, ParseError::UnicodeError(8)),
+        (r#""\uD83E""#, ParseError::UnicodeError(7)),
+        (r#""\uD83E\uDD0G""#, ParseError::UnicodeError(8)),
+        (r#""x\u12""#, ParseError::UnicodeError(3)),
+    ] {
+        assert_eq!(parse_json(input, None), Err(expected), "input {input:?}");
+    }
+}
+
+#[test]
+fn test_json_string_rejects_truncated_surrogate_escapes() {
+    for input in [r#""\uD83E"#, r#""\uD83E\uDD"#] {
+        assert_eq!(
+            parse_json(input, None),
+            Err(ParseError::UnexpectedEOF(input.len())),
+            "input {input:?}"
+        );
+    }
 }
 
 #[test]
