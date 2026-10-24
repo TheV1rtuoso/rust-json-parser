@@ -1,15 +1,13 @@
 use std::{
     char,
     collections::HashMap,
-    dbg, eprintln,
+    eprintln,
     num::{ParseFloatError, ParseIntError},
-    ops::RangeInclusive,
-    str,
 };
 
 use crate::{
     JsonElement::IntegerNumber,
-    ParseError::{LeadingZero, UTF8Error, UnexpectedEOF, UnexpectedToken},
+    ParseError::{LeadingZero, UTF8Error, UnexpectedToken, UnicodeError},
 };
 #[cfg(test)]
 mod system_tests;
@@ -146,57 +144,57 @@ impl<'a> Parser<'a> {
                 match self.input[self.position] {
                     b'\\' => {
                         output.push('\\');
+                        self.position += 1;
                     }
                     b'n' => {
                         output.push('\n');
+                        self.position += 1;
+                    }
+                    b'b' => {
+                        output.push('\u{0008}');
+                        self.position += 1;
+                    }
+                    b'f' => {
+                        output.push('\u{000C}');
+                        self.position += 1;
                     }
                     b'r' => {
                         output.push('\r');
+                        self.position += 1;
                     }
                     b'/' => {
                         output.push('/');
+                        self.position += 1;
                     }
                     b't' => {
                         output.push('\t');
+                        self.position += 1;
                     }
                     b'"' => {
                         output.push('"');
+                        self.position += 1;
                     }
                     b'u' => {
-                        const HIGH_SURROGATE_RANGE: RangeInclusive<u32> = 0xD800..=0xDBFF;
-                        if self.position + 5 > self.input.len() {
-                            return Err(UnexpectedEOF(self.input.len()));
-                        }
-                        let text =
-                            str::from_utf8(&self.input[self.position + 1..self.position + 5])
-                                .map_err(|_| ParseError::UnicodeError(self.position))?;
-                        let first_escape: u32 = u32::from_str_radix(text, 16)
-                            .map_err(|_| ParseError::UnicodeError(self.position))?;
-                        dbg!(first_escape);
-                        let c: char = if HIGH_SURROGATE_RANGE.contains(&first_escape) {
-                            self.position += 5;
-                            self.accept(b'\\')
-                                .map_err(|_| ParseError::UnicodeError(self.position))?;
-                            self.accept(b'u')
-                                .map_err(|_| ParseError::UnicodeError(self.position))?;
-                            if self.position + 4 > self.input.len() {
-                                return Err(UnexpectedEOF(self.input.len()));
+                        let mut err_position = self.position;
+                        let first_escape = self.parse_unicode_escape()?;
+                        let c: char = if (0xD800..=0xDBFF).contains(&first_escape) {
+                            self.accept_or(b'\\', UnicodeError)?;
+                            err_position = self.position;
+                            let second_escape = self.parse_unicode_escape()?;
+                            if !(0xDC00..=0xDFFF).contains(&second_escape) {
+                                return Err(ParseError::UnicodeError(err_position));
                             }
-                            let text =
-                                str::from_utf8(&self.input[self.position..self.position + 4])
-                                    .map_err(|_| ParseError::UnicodeError(self.position))?;
-                            let second_escape: u32 = u32::from_str_radix(text, 16)
-                                .map_err(|_| ParseError::UnicodeError(self.position))?;
-                            self.position += 3;
                             let full_escape = 0x10000
                                 + ((first_escape - 0xD800) << 10)
                                 + (second_escape - 0xDC00);
                             char::from_u32(full_escape)
-                                .ok_or(ParseError::UnicodeError(self.position))?
+                                .ok_or(ParseError::UnicodeError(err_position))?
                         } else {
-                            self.position += 4;
+                            if (0xDC00..=0xDFFF).contains(&first_escape) {
+                                return Err(ParseError::UnicodeError(err_position));
+                            }
                             char::from_u32(first_escape)
-                                .ok_or(ParseError::UnicodeError(self.position))?
+                                .ok_or(ParseError::UnicodeError(err_position))?
                         };
                         output.push(c);
                     }
@@ -205,7 +203,6 @@ impl<'a> Parser<'a> {
                     }
                 }
                 is_escaped = false;
-                self.position += 1
             } else {
                 match self.input[self.position] {
                     b'\\' => {
@@ -256,12 +253,41 @@ impl<'a> Parser<'a> {
         self.accept(b'"')?;
         Ok(JsonElement::String(output))
     }
+
+    fn parse_unicode_escape(&mut self) -> Result<u32, ParseError> {
+        let start = self.position;
+        self.accept_or(b'u', UnicodeError)?;
+        let mut value = 0;
+        for _ in 0..4 {
+            let byte = self.curr()?;
+            let digit = match byte {
+                b'0'..=b'9' => (byte - b'0') as u32,
+                b'a'..=b'f' => (byte - b'a' + 10) as u32,
+                b'A'..=b'F' => (byte - b'A' + 10) as u32,
+                _ => return Err(ParseError::UnicodeError(start)),
+            };
+            value = (value << 4) | digit;
+            self.position += 1;
+        }
+        Ok(value)
+    }
     fn accept(&mut self, expected: u8) -> Result<(), ParseError> {
         if self.curr()? == expected {
             self.position += 1;
             Ok(())
         } else {
             Err(ParseError::UnexpectedToken(self.position))
+        }
+    }
+    fn accept_or<T>(&mut self, expected: u8, f: T) -> Result<(), ParseError>
+    where
+        T: FnOnce(usize) -> ParseError,
+    {
+        if self.curr()? == expected {
+            self.position += 1;
+            Ok(())
+        } else {
+            Err(f(self.position))
         }
     }
 
